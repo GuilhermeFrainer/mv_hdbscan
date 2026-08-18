@@ -6,4 +6,17 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "marimo[recommended]>=0.24.0",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
