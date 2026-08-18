@@ -11,3 +11,6 @@ wheels/
 
 # Binary files
 papers/*.pdf
+
+# Agents
+.agents/
