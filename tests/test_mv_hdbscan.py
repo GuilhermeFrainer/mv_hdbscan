@@ -141,6 +141,112 @@ class TestMultiViewHDBSCAN:
             model.set_params(weights=None, fusion="invalid_strategy")
             model.fit([np.zeros((10, 2)), np.zeros((10, 2))])
 
+    def test_heterogeneous_metrics_cosine_euclidean(self):
+        """Test MultiViewHDBSCAN with heterogeneous per-view metrics (cosine and euclidean)."""
+        rng = np.random.default_rng(42)
+        n_per_cluster = 40
+        n_samples = n_per_cluster * 3
+        y = np.repeat([0, 1, 2], n_per_cluster)
+
+        # View 1: 32-dim normalized embeddings on hypersphere
+        centers_v1 = np.zeros((3, 32))
+        centers_v1[0, 0] = 1.0
+        centers_v1[1, 1] = 1.0
+        centers_v1[2, 2] = 1.0
+
+        v1_list = []
+        for c in range(3):
+            noise = rng.normal(0, 0.15, size=(n_per_cluster, 32))
+            pts = centers_v1[c] + noise
+            pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+            v1_list.append(pts)
+        X1 = np.vstack(v1_list)
+
+        # View 2: 2D Euclidean features
+        centers_v2 = np.array([[0.0, 0.0], [5.0, 0.0], [2.5, 5.0]])
+        v2_list = []
+        for c in range(3):
+            noise = rng.normal(0, 0.3, size=(n_per_cluster, 2))
+            v2_list.append(centers_v2[c] + noise)
+        X2 = np.vstack(v2_list)
+
+        model = MultiViewHDBSCAN(
+            min_cluster_size=10,
+            min_samples=5,
+            metric=["cosine", "euclidean"],
+            fusion="max",
+            scale_views=True,
+        )
+        labels = model.fit_predict([X1, X2])
+
+        assert model.metrics_ == ["cosine", "euclidean"]
+        valid_idx = labels != -1
+        assert np.sum(valid_idx) > 0.8 * n_samples
+        ari = adjusted_rand_score(y[valid_idx], labels[valid_idx])
+        assert ari > 0.85
+
+    def test_metric_validation(self):
+        """Test metric type and length validation."""
+        views, _ = generate_synthetic_multiview_data(n_samples=60)
+
+        # Mismatched sequence length
+        model_mismatch = MultiViewHDBSCAN(metric=["cosine"])
+        with pytest.raises(ValueError, match="Length of metric sequence"):
+            model_mismatch.fit(views)
+
+        model_mismatch3 = MultiViewHDBSCAN(metric=["cosine", "euclidean", "manhattan"])
+        with pytest.raises(ValueError, match="Length of metric sequence"):
+            model_mismatch3.fit(views)
+
+        # Invalid type
+        model_bad_type = MultiViewHDBSCAN(metric=123)
+        with pytest.raises(TypeError, match=r"metric must be a str, callable"):
+            model_bad_type.fit(views)
+
+    def test_scale_invariance_heterogeneous_metrics(self):
+        """Test that scale_views=True provides scale invariance when fusing disparate metrics."""
+        rng = np.random.default_rng(42)
+        n = 50
+        # View 1: Cosine distances in [0, 1]
+        X1 = rng.normal(size=(n, 16))
+        X1 /= np.linalg.norm(X1, axis=1, keepdims=True)
+
+        # View 2: Euclidean metadata
+        X2_orig = rng.normal(loc=0, scale=1.0, size=(n, 4))
+        # Scaled by 10,000x
+        X2_scaled = X2_orig * 10000.0
+
+        model_orig = MultiViewHDBSCAN(
+            min_cluster_size=5,
+            metric=["cosine", "euclidean"],
+            scale_views=True,
+            scale_percentile=95.0,
+            fusion="mean",
+        ).fit([X1, X2_orig])
+
+        model_scaled = MultiViewHDBSCAN(
+            min_cluster_size=5,
+            metric=["cosine", "euclidean"],
+            scale_views=True,
+            scale_percentile=95.0,
+            fusion="mean",
+        ).fit([X1, X2_scaled])
+
+        np.testing.assert_allclose(
+            model_orig.fused_reachability_,
+            model_scaled.fused_reachability_,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        np.testing.assert_array_equal(model_orig.labels_, model_scaled.labels_)
+
+    def test_estimator_cloning_with_metric_sequence(self):
+        """Test scikit-learn clone with list of metrics."""
+        model = MultiViewHDBSCAN(metric=["cosine", "cityblock"], min_cluster_size=12)
+        cloned = clone(model)
+        assert cloned.metric == ["cosine", "cityblock"]
+        assert cloned.min_cluster_size == 12
+
 
 class TestFeatureStackingHDBSCAN:
     def test_sklearn_estimator_conventions(self):

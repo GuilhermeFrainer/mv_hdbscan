@@ -4,7 +4,7 @@ This module implements a scikit-learn compatible Multi-View HDBSCAN clustering
 estimator based on mutual reachability graph fusion across multiple views.
 """
 
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from scipy.spatial.distance import pdist, squareform
 from sklearn.base import BaseEstimator, ClusterMixin
@@ -40,8 +40,10 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
         Weights are automatically normalized to sum to 1.0.
     p : float, default=2.0
         Power exponent used when `fusion="lp"`.
-    metric : str, default="euclidean"
-        Metric used to compute pairwise distances in each view.
+    metric : str, callable, or sequence of str/callable, default="euclidean"
+        Metric used to compute pairwise distances in each view. Can be a single metric
+        string/callable applied across all views, or a sequence specifying a distinct metric
+        per view (e.g. ``["cosine", "euclidean"]``).
     scale_views : bool, default=True
         Whether to normalize each view's pairwise distance matrix by its `scale_percentile`
         so that heterogeneous views with different natural scales have commensurate reachabilities.
@@ -68,6 +70,8 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
         List of core distance arrays for each view, each of shape (n_samples,).
     weights_ : np.ndarray of shape (n_views,)
         The normalized weights assigned to each view.
+    metrics_ : list of str or callable
+        The resolved metric used for each view.
     n_samples_in_ : int
         The number of samples in the fitted dataset.
     n_features_in_ : list of int
@@ -83,7 +87,7 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
         fusion: str = "max",
         weights: Optional[Sequence[float]] = None,
         p: float = 2.0,
-        metric: str = "euclidean",
+        metric: Union[str, Callable, Sequence[Union[str, Callable]]] = "euclidean",
         scale_views: bool = True,
         scale_percentile: float = 95.0,
         cluster_selection_epsilon: float = 0.0,
@@ -133,13 +137,20 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
         return views
 
     def _compute_view_reachability(
-        self, X_v: np.ndarray, effective_min_samples: int
+        self,
+        X_v: np.ndarray,
+        effective_min_samples: int,
+        metric_v: Union[str, Callable] = "euclidean",
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute pairwise distance, core distances, and mutual reachability for a single view."""
         n_samples = X_v.shape[0]
         k = min(max(1, effective_min_samples), n_samples - 1)
 
-        D = squareform(pdist(X_v, metric=self.metric))
+        D = squareform(pdist(X_v, metric=metric_v))
+        # Ensure numerical non-negativity and zero diagonal (e.g. for cosine precision quirks)
+        np.maximum(D, 0.0, out=D)
+        np.fill_diagonal(D, 0.0)
+
         sorted_dists = np.sort(D, axis=1)
         core_dists = sorted_dists[:, k]
 
@@ -266,13 +277,30 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
 
         self.weights_ = raw_weights / np.sum(raw_weights)
 
+        # Resolve and validate view metrics
+        if isinstance(self.metric, (str, bytes)) or callable(self.metric):
+            metrics = [self.metric] * n_views
+        elif isinstance(self.metric, (list, tuple, np.ndarray)):
+            if len(self.metric) != n_views:
+                raise ValueError(
+                    f"Length of metric sequence ({len(self.metric)}) does not match number of views ({n_views})."
+                )
+            metrics = list(self.metric)
+        else:
+            raise TypeError(
+                f"metric must be a str, callable, or sequence of str/callable. Got {type(self.metric)}."
+            )
+        self.metrics_ = metrics
+
         # Compute view-wise distances and mutual reachability
         view_dists = []
         view_cores = []
         view_mreaches = []
 
-        for v_idx, X_v in enumerate(views):
-            D_v, core_v, mr_v = self._compute_view_reachability(X_v, effective_min_samples)
+        for v_idx, (X_v, m_v) in enumerate(zip(views, self.metrics_)):
+            D_v, core_v, mr_v = self._compute_view_reachability(
+                X_v, effective_min_samples, metric_v=m_v
+            )
             view_dists.append(D_v)
             view_cores.append(core_v)
             view_mreaches.append(mr_v)
