@@ -2,13 +2,13 @@
 
 This module implements a baseline clustering estimator that standardizes and
 concatenates (stacks) all multi-view feature representations horizontally into a single
-feature space before applying standard single-view HDBSCAN.
+feature space before applying standard single-view HDBSCAN (the ``hdbscan`` library).
 """
 
 from typing import List, Optional, Sequence, Union
 import numpy as np
+from hdbscan import HDBSCAN
 from sklearn.base import BaseEstimator, ClusterMixin
-from sklearn.cluster import HDBSCAN
 
 
 class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
@@ -18,13 +18,22 @@ class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
     concatenates all views into a single unified feature matrix X_stacked = [X^(1), X^(2), ..., X^(V)]
     before fitting standard HDBSCAN.
 
+    Clustering is done by ``hdbscan.HDBSCAN`` (the ``hdbscan`` library, the one BERTopic
+    uses), not by ``sklearn.cluster.HDBSCAN``. Every argument that is not a parameter of
+    this class is left at the library's default, in particular ``algorithm``, so that the
+    estimator runs the same code path as a plain ``hdbscan.HDBSCAN`` on the stacked features.
+
     Parameters
     ----------
     min_cluster_size : int, default=5
         The minimum number of samples in a group for that group to be considered a cluster.
     min_samples : int or None, default=None
         The number of samples in a neighborhood for a point to be considered a core point.
-        If None, defaults to `min_cluster_size`.
+        Follows the ``hdbscan`` library's convention: the point itself is not counted, so
+        the core distance is the distance to the `min_samples`-th other point
+        (``sklearn.cluster.HDBSCAN`` counts the point itself and is one neighbor short of
+        this). Passed to the library as given; if None, the library defaults it to
+        `min_cluster_size`.
     standardize : bool, default=True
         Whether to standardize each view (zero mean, unit variance) prior to concatenation.
     metric : str, default="euclidean"
@@ -35,8 +44,13 @@ class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
         The method used to select clusters from the condensed tree.
     allow_single_cluster : bool, default=False
         Whether to allow the extraction of a single cluster.
+    approx_min_span_tree : bool, default=True
+        Passed to ``hdbscan.HDBSCAN``. True is the library's default: the minimum spanning
+        tree may be built approximately (Boruvka), which is faster but can change the
+        partition. False builds the exact tree.
     n_jobs : int or None, default=None
-        Number of parallel jobs to run for HDBSCAN tree extraction.
+        Number of parallel jobs for the core distance computation (the library's
+        ``core_dist_n_jobs``). If None, the library's default is used.
 
     Attributes
     ----------
@@ -52,7 +66,7 @@ class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
         Number of features per view in the fitted dataset.
     n_stacked_features_ : int
         Total number of features across all stacked views.
-    hdbscan_ : sklearn.cluster.HDBSCAN
+    hdbscan_ : hdbscan.HDBSCAN
         The underlying fitted HDBSCAN instance.
     """
 
@@ -65,6 +79,7 @@ class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
         cluster_selection_epsilon: float = 0.0,
         cluster_selection_method: str = "eom",
         allow_single_cluster: bool = False,
+        approx_min_span_tree: bool = True,
         n_jobs: Optional[int] = None,
     ):
         self.min_cluster_size = min_cluster_size
@@ -74,6 +89,7 @@ class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
         self.cluster_selection_epsilon = cluster_selection_epsilon
         self.cluster_selection_method = cluster_selection_method
         self.allow_single_cluster = allow_single_cluster
+        self.approx_min_span_tree = approx_min_span_tree
         self.n_jobs = n_jobs
 
     def _validate_and_format_views(self, X: Union[Sequence[np.ndarray], np.ndarray]) -> List[np.ndarray]:
@@ -125,11 +141,8 @@ class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
         if self.min_cluster_size < 2:
             raise ValueError(f"min_cluster_size must be >= 2, got {self.min_cluster_size}.")
 
-        effective_min_samples = (
-            self.min_samples if self.min_samples is not None else self.min_cluster_size
-        )
-        if effective_min_samples < 1:
-            raise ValueError(f"min_samples must be >= 1, got {effective_min_samples}.")
+        if self.min_samples is not None and self.min_samples < 1:
+            raise ValueError(f"min_samples must be >= 1, got {self.min_samples}.")
 
         # Process and stack views
         processed_views = []
@@ -145,16 +158,22 @@ class FeatureStackingHDBSCAN(BaseEstimator, ClusterMixin):
         self.stacked_features_ = np.hstack(processed_views)
         self.n_stacked_features_ = self.stacked_features_.shape[1]
 
-        # Fit HDBSCAN on stacked feature matrix
+        # Fit HDBSCAN (hdbscan library) on the stacked feature matrix. Arguments not listed
+        # here stay at the library's defaults (notably `algorithm`), so this is the same
+        # code path as a plain hdbscan.HDBSCAN. min_samples is passed as given: None lets
+        # the library default it to min_cluster_size.
+        hdbscan_kwargs = {}
+        if self.n_jobs is not None:
+            hdbscan_kwargs["core_dist_n_jobs"] = self.n_jobs
         self.hdbscan_ = HDBSCAN(
             min_cluster_size=self.min_cluster_size,
-            min_samples=effective_min_samples,
+            min_samples=self.min_samples,
             metric=self.metric,
             cluster_selection_epsilon=self.cluster_selection_epsilon,
             cluster_selection_method=self.cluster_selection_method,
             allow_single_cluster=self.allow_single_cluster,
-            copy=True,
-            n_jobs=self.n_jobs,
+            approx_min_span_tree=self.approx_min_span_tree,
+            **hdbscan_kwargs,
         )
 
         self.labels_ = self.hdbscan_.fit_predict(self.stacked_features_)

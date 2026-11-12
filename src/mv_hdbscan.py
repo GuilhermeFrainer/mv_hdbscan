@@ -7,8 +7,8 @@ estimator based on mutual reachability graph fusion across multiple views.
 from typing import Callable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from scipy.spatial.distance import pdist, squareform
+from hdbscan import HDBSCAN
 from sklearn.base import BaseEstimator, ClusterMixin
-from sklearn.cluster import HDBSCAN
 
 
 class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
@@ -19,12 +19,23 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
     mutual reachability graphs, and fusing them into a unified multi-view reachability matrix
     before extracting persistent hierarchical clusters via Excess of Mass (EoM).
 
+    The cluster hierarchy is built on the fused matrix itself: the fused matrix is already
+    a mutual reachability, and no further core distance or mutual reachability step is
+    applied to it. The hierarchy and the cluster extraction are done by the ``hdbscan``
+    library (``hdbscan.HDBSCAN`` on a precomputed matrix), which always builds an exact
+    minimum spanning tree on this path.
+
     Parameters
     ----------
     min_cluster_size : int, default=5
         The minimum number of samples in a group for that group to be considered a cluster.
     min_samples : int or None, default=None
         The number of samples in a neighborhood for a point to be considered a core point.
+        Follows the ``hdbscan`` library's convention: the point itself is not counted, so
+        the core distance is the distance to the `min_samples`-th other point
+        (``sklearn.cluster.HDBSCAN`` counts the point itself and is one neighbor short of
+        this). It sets the per-view core distances only (for ``fusion="l2_metric"``, the
+        core distances of the fused distance); it is not applied again to the fused matrix.
         If None, defaults to `min_cluster_size`.
     fusion : {"max", "mean", "lp", "l2_metric", "min"}, default="max"
         Strategy used to fuse mutual reachability matrices across views:
@@ -56,7 +67,8 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
     allow_single_cluster : bool, default=False
         Whether to allow the extraction of a single cluster.
     n_jobs : int or None, default=None
-        Number of parallel jobs to run for HDBSCAN tree extraction.
+        Number of parallel jobs passed to the library as ``core_dist_n_jobs``. If None, the
+        library's default is used.
 
     Attributes
     ----------
@@ -76,8 +88,8 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
         The number of samples in the fitted dataset.
     n_features_in_ : list of int
         Number of features per view in the fitted dataset.
-    hdbscan_ : sklearn.cluster.HDBSCAN
-        The underlying fitted HDBSCAN instance.
+    hdbscan_ : hdbscan.HDBSCAN
+        The underlying fitted HDBSCAN instance (``metric="precomputed"``, ``min_samples=1``).
     """
 
     def __init__(
@@ -312,19 +324,30 @@ class MultiViewHDBSCAN(BaseEstimator, ClusterMixin):
             view_mreaches, view_dists, self.weights_, effective_min_samples
         )
 
-        # Fit HDBSCAN on the unified mutual reachability matrix
+        # Build the hierarchy on the fused matrix itself. Every fusion mode returns a
+        # matrix that is already a mutual reachability, but the library treats a
+        # precomputed matrix as plain distances: it computes core distances on it and
+        # applies max(core_p, core_q, d) once more. min_samples=1 makes that step a no-op:
+        # the core distance it computes for a row is then one of the row's smallest
+        # entries, which never exceeds any off-diagonal entry of that row (or, by
+        # symmetry, of that column), so max(core_p, core_q, d) = d. The user-facing
+        # min_samples has already been used above, for the per-view core distances; it
+        # must not be passed here, or mutual reachability would be applied twice.
+        hdbscan_kwargs = {}
+        if self.n_jobs is not None:
+            hdbscan_kwargs["core_dist_n_jobs"] = self.n_jobs
         self.hdbscan_ = HDBSCAN(
             min_cluster_size=self.min_cluster_size,
-            min_samples=effective_min_samples,
+            min_samples=1,
             metric="precomputed",
             cluster_selection_epsilon=self.cluster_selection_epsilon,
             cluster_selection_method=self.cluster_selection_method,
             allow_single_cluster=self.allow_single_cluster,
-            copy=True,
-            n_jobs=self.n_jobs,
+            **hdbscan_kwargs,
         )
 
-        self.labels_ = self.hdbscan_.fit_predict(self.fused_reachability_)
+        # Fit on a copy so that fused_reachability_ is left as computed.
+        self.labels_ = self.hdbscan_.fit_predict(self.fused_reachability_.copy())
         self.probabilities_ = getattr(self.hdbscan_, "probabilities_", np.ones(self.n_samples_in_))
 
         return self
